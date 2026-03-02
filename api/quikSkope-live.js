@@ -1348,7 +1348,20 @@ async function fillForm(page, data, log) {
     return { success: true };
 
   } catch (error) {
-    log(`⚠️ Confirm error: ${error.message} - assuming success (form was saved)`);
+    // Validation/toast errors must propagate as failures
+    if (
+      error.message.includes('Form validation failed') ||
+      error.message.includes('validation') ||
+      error.message.includes('already been taken') ||
+      error.message.includes('already engaged')
+    ) {
+      log(`❌ Validation error: ${error.message}`);
+      const totalDuration = Date.now() - formStart;
+      log(`=== FORM FILL FAILED (Total: ${totalDuration}ms) ===`);
+      return { success: false, toastError: error.message, errorType: 'validation_error' };
+    }
+    // Only assume success for navigation/CDP errors after confirm click
+    log(`⚠️ Confirm navigation error: ${error.message} - assuming form was saved`);
     const totalDuration = Date.now() - formStart;
     log(`=== FORM FILL COMPLETE (Total: ${totalDuration}ms) ===`);
     return { success: true };

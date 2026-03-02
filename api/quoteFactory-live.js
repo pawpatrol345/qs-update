@@ -187,11 +187,16 @@ class QuikSkopeAutomation {
       // Try direct login first (simpler approach like old version)
       try {
         await this.page.goto('https://app.quotefactory.com', {
-          waitUntil: 'domcontentloaded',
+          waitUntil: 'networkidle2',
           timeout: 60000
         });
-      } catch {}
-     
+      } catch {
+        // goto may throw if Auth0 redirect happens mid-navigation — wait for it to settle
+        try {
+          await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+        } catch {}
+      }
+
       await this.wait(3000);
 
       // Check if already logged in
@@ -207,10 +212,25 @@ class QuikSkopeAutomation {
         await this.page.waitForSelector('.auth0-lock-widget', { timeout: 8000 });
         await this.wait(2000);
       } catch {
-        await this.page.waitForFunction(
-          () => document.querySelectorAll('input[type="email"], input[type="password"]').length >= 2,
-          { timeout: 30000 }
-        );
+        try {
+          await this.page.waitForFunction(
+            () => document.querySelectorAll('input[type="email"], input[type="password"]').length >= 2,
+            { timeout: 30000 }
+          );
+        } catch (fnErr) {
+          // If frame was detached mid-redirect, wait for navigation to settle then retry
+          if (fnErr.message && (fnErr.message.includes('detached') || fnErr.message.includes('Execution context was destroyed'))) {
+            console.log('⚠️ Frame detached during waitForFunction — waiting for redirect to settle...');
+            try { await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }); } catch {}
+            await this.wait(2000);
+            await this.page.waitForFunction(
+              () => document.querySelectorAll('input[type="email"], input[type="password"]').length >= 2,
+              { timeout: 30000 }
+            );
+          } else {
+            throw fnErr;
+          }
+        }
       }
 
       // Find and fill email

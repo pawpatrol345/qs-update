@@ -1516,12 +1516,14 @@ export default async function handler(req, res) {
     const fillResult = await fillForm(page, data, log);
 
     if (!fillResult.success) {
-      const isToast = fillResult.errorType === 'toast_error';
-      log(`❌ Form fill failed: ${fillResult.toastError || 'unknown error'}`);
-      return res.status(400).json({
-        error: isToast ? fillResult.toastError : 'Form fill failed',
+      const errorMsg = fillResult.toastError || fillResult.errorMessage || 'Form fill failed';
+      log(`❌ Form fill failed: ${errorMsg}`);
+      return res.status(200).json({
+        success: false,
+        error: true,
+        errorMessage: errorMsg,
         errorType: fillResult.errorType || 'fill_error',
-        toastMessage: fillResult.toastError || null,
+        toastAlert: fillResult.toastError || null,
         logs
       });
     }

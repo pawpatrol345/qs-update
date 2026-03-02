@@ -3,7 +3,7 @@
   "functions": {
     "api/**/*.js": {
       "memory": 2048,
-      "maxDuration": 60
+      "maxDuration": 300
     }
   }
 }

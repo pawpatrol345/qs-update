@@ -3,131 +3,221 @@ import chromium from "@sparticuz/chromium";
 
 const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Enhanced parseZapierData function with flexible driver name parsing
+// ============================================================================
+// CONSTANTS & CONFIGURATION
+// ============================================================================
 
-function parseZapierData(zapierData) {
-  // Utility function to parse and normalize driver name
-  const parseDriverName = (str) => {
-    if (!str) return '';
+const SELECTORS = {
+  // Form fields
+  loadNumber: 'input[name="load_number"]',
+  driverName: 'input[name="driver_name"]',
+  driverPhone: 'input#adminProfileDailingCode[name="phone_number"]',
+  carrierName: 'input[name="carrier_name"]',
+  carrierMC: 'input[name="carrier_mc_number"]',
+  carrierDOT: 'input[name="carrier_dot_number"]',
+  
+  // Buttons
+  multipleLoadBtn: '#multipleLoadButton',
+  addMoreForm: '#addMorePickupDropForm',
+  saveBtn: '#saveAndContinuePreviewLoad',
+  confirmBtn: '#confirmLoadData',
+  createLoadBtn: 'a#createLoadByForm',
+  
+  // Modal & errors
+  confirmModal: '#viewLoadReceiptModel',
+  toastError: '.toastr.toast-error, .toast-error, div.toast-error',
+  
+  // Checkboxes
+  clonePickupCheckbox: '#addpickcheck',
+  cloneDropCheckbox: '#addpickcheck1',
+};
+
+const TIMEOUTS = {
+  navigation: 30000,  // Increased from 12s to 30s
+  selector: 15000,    // Increased from 8s to 15s
+  short: 3000,        // Increased from 1s to 3s
+  modal: 18000,       // Increased from 6s to 18s
+};
+
+const WAITS = {
+  afterType: 100,           // Increased from 50ms
+  afterAutocomplete: 100,   // Increased from 50ms
+  afterFieldSet: 100,       // Increased from 50ms
+  afterClick: 500,          // Increased from 300ms
+  afterFormAdd: 500,        // Increased from 300ms
+  modalCheck: 300,
+  pageStabilize: 2000,      // Increased from 1500ms
+  betweenAddresses: 2000,   // NEW: wait between geocoding operations
+};
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * Check if browser/page is still alive
+ */
+async function ensureBrowserAlive(page, log) {
+  try {
+    await page.evaluate(() => document.title);
+    return true;
+  } catch (error) {
+    log(`❌ Browser connection lost: ${error.message}`);
+    throw new Error('Browser crashed or disconnected');
+  }
+}
+
+/**
+ * Check for toast error messages on the page
+ */
+const checkForToastError = async (page) => {
+  return await page.evaluate((selector) => {
+    const toastError = document.querySelector(selector);
+    if (!toastError) return { found: false };
     
-    // Convert to string and trim
-    let name = String(str).trim();
-    if (!name) return '';
+    // Try multiple methods to extract error message
+    const messageEl = toastError.querySelector('.toast-message');
+    let message = messageEl?.textContent.trim() || '';
     
-    // Remove extra whitespace (multiple spaces to single space)
-    name = name.replace(/\s+/g, ' ');
-    
-    // Handle comma-separated format (e.g., "PETIT, SAMSON" or "petit, samson")
-    if (name.includes(',')) {
-      const parts = name.split(',').map(part => part.trim()).filter(part => part);
-      // Reverse order: "PETIT, SAMSON" becomes "SAMSON PETIT"
-      name = parts.reverse().join(' ');
+    if (!message) {
+      message = toastError.textContent
+        .replace(/Close/gi, '')
+        .replace(/×/g, '')
+        .trim();
     }
     
-    // Normalize to Title Case (First letter uppercase, rest lowercase)
-    name = name.split(' ')
-      .map(word => {
-        if (!word) return '';
-        return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
-      })
-      .join(' ');
-    
-    return name;
-  };
-
-  // Parse array for addresses 
-  const parseArr = (str) => {
-    if (!str) return [];
-    if (Array.isArray(str)) return str.map(n => String(n));
-   
-    const strVal = String(str).trim();
-   
-    const usaSplitPattern = /,\s*USA\s*(?=\d|\w)/i;
-    if (usaSplitPattern.test(strVal)) {
-      const addresses = strVal.split(usaSplitPattern).map(addr => {
-        const trimmed = addr.trim();
-        return trimmed.toUpperCase().endsWith(', USA') ? trimmed : `${trimmed}, USA`;
-      });
-      
-      if (addresses.length > 1) {
-        return addresses.filter(a => a && a.length > 10);
-      }
+    if (!message && toastError.dataset?.message) {
+      message = toastError.dataset.message;
     }
-   
-    const stateZipPattern = /([A-Z]{2}\s+\d{5}(?:-\d{4})?)/g;
-    const matches = [...strVal.matchAll(stateZipPattern)];
-   
-    if (matches.length > 1) {
-      const addresses = [];
+    
+    return { 
+      found: true, 
+      message: message || 'Unknown error occurred',
+      html: toastError.outerHTML.substring(0, 200)
+    };
+  }, SELECTORS.toastError);
+};
+
+/**
+ * Parse and normalize driver name
+ */
+const parseDriverName = (str) => {
+  if (!str) return '';
+  
+  let name = String(str).trim().replace(/\s+/g, ' ');
+  if (!name) return '';
+  
+  // Reverse "Last, First" format
+  if (name.includes(',')) {
+    const parts = name.split(',').map(part => part.trim()).filter(Boolean);
+    name = parts.reverse().join(' ');
+  }
+  
+  // Capitalize each word
+  return name.split(' ')
+    .map(word => word ? word.charAt(0).toUpperCase() + word.slice(1).toLowerCase() : '')
+    .join(' ');
+};
+
+/**
+ * Parse array from string with intelligent address splitting
+ */
+const parseAddressArray = (str) => {
+  if (!str) return [];
+  if (Array.isArray(str)) return str.map(String);
+  
+  const strVal = String(str).trim();
+  
+  // Split on ", USA" pattern for multiple addresses
+  const usaSplitPattern = /,\s*USA\s*(?=\d|\w)/i;
+  if (usaSplitPattern.test(strVal)) {
+    const addresses = strVal.split(usaSplitPattern).map(addr => {
+      const trimmed = addr.trim();
+      return trimmed.toUpperCase().endsWith(', USA') ? trimmed : `${trimmed}, USA`;
+    });
+    
+    if (addresses.length > 1) {
+      return addresses.filter(a => a && a.length > 10);
+    }
+  }
+  
+  // Split on state+zip pattern for multiple addresses
+  const stateZipPattern = /([A-Z]{2}\s+\d{5}(?:-\d{4})?)/g;
+  const matches = [...strVal.matchAll(stateZipPattern)];
+  
+  if (matches.length > 1) {
+    const addresses = [];
+    
+    for (let i = 0; i < matches.length; i++) {
+      const match = matches[i];
+      const matchEnd = match.index + match[0].length;
       
-      for (let i = 0; i < matches.length; i++) {
-        const match = matches[i];
-        const matchEnd = match.index + match[0].length;
+      let addrStart = 0;
+      if (i > 0) {
+        const prevMatchEnd = matches[i - 1].index + matches[i - 1][0].length;
+        let searchStart = prevMatchEnd;
         
-        let addrStart = 0;
-        if (i > 0) {
-          const prevMatchEnd = matches[i - 1].index + matches[i - 1][0].length;
-          let searchStart = prevMatchEnd;
-          
-          const afterPrevMatch = strVal.substring(prevMatchEnd);
-          const usaMatch = afterPrevMatch.match(/^\s*,?\s*USA\s*/i);
-          if (usaMatch) {
-            searchStart = prevMatchEnd + usaMatch[0].length;
-          }
-          
-          addrStart = strVal.substring(searchStart).search(/\S/) + searchStart;
-        }
-        
-        let addrEnd = matchEnd;
-        const afterMatch = strVal.substring(matchEnd);
-        const usaMatch = afterMatch.match(/^\s*,?\s*USA/i);
+        const afterPrevMatch = strVal.substring(prevMatchEnd);
+        const usaMatch = afterPrevMatch.match(/^\s*,?\s*USA\s*/i);
         if (usaMatch) {
-          addrEnd = matchEnd + usaMatch[0].length;
+          searchStart = prevMatchEnd + usaMatch[0].length;
         }
         
-        const addr = strVal.substring(addrStart, addrEnd).trim().replace(/^,\s*/, '');
-        if (addr && addr.length > 10) {
-          addresses.push(addr.toUpperCase().endsWith(', USA') ? addr : `${addr}, USA`);
-        }
+        addrStart = strVal.substring(searchStart).search(/\S/) + searchStart;
       }
       
-      if (addresses.length > 0) {
-        return addresses;
+      let addrEnd = matchEnd;
+      const afterMatch = strVal.substring(matchEnd);
+      const usaMatch = afterMatch.match(/^\s*,?\s*USA/i);
+      if (usaMatch) {
+        addrEnd = matchEnd + usaMatch[0].length;
+      }
+      
+      const addr = strVal.substring(addrStart, addrEnd).trim().replace(/^,\s*/, '');
+      if (addr && addr.length > 10) {
+        addresses.push(addr.toUpperCase().endsWith(', USA') ? addr : `${addr}, USA`);
       }
     }
-   
-    return [strVal].filter(n => n);
-  };
- 
-  const parseArrMultiple = (str) => {
-    if (!str) return [];
-    if (Array.isArray(str)) return str.map(n => String(n));
     
-    if (typeof str === 'object' && str !== null && !Array.isArray(str)) {
-      console.log('📋 Parsing object:', JSON.stringify(str));
-      const keys = Object.keys(str).sort((a, b) => parseInt(a) - parseInt(b));
-      const values = keys.map(key => String(str[key])).filter(n => n && n.trim());
-      console.log('  → Extracted values:', values);
-      return values;
-    }
-    
-    return String(str).split(',').map(n => n.trim()).filter(n => n);
-  };
- 
-  // Extract raw driver name from various possible fields
+    if (addresses.length > 0) return addresses;
+  }
+  
+  return [strVal].filter(Boolean);
+};
+
+/**
+ * Parse simple comma-separated array or object with numeric keys
+ */
+const parseSimpleArray = (str) => {
+  if (!str) return [];
+  if (Array.isArray(str)) return str.map(String);
+  
+  // Handle object with numeric keys
+  if (typeof str === 'object' && str !== null) {
+    const keys = Object.keys(str).sort((a, b) => parseInt(a) - parseInt(b));
+    return keys.map(key => String(str[key])).filter(n => n && n.trim());
+  }
+  
+  return String(str)
+    .split(',')
+    .map(n => n.trim())
+    .filter(n => n && n !== '#');
+};
+
+/**
+ * Parse Zapier data into structured format
+ */
+function parseZapierData(zapierData) {
   const rawDriverName = zapierData.driverName || 
                         zapierData.driver_name || 
                         zapierData.driver || 
                         zapierData["8. Data Driver Name"] ||
                         '';
   
-  // Parse and normalize the driver name
   const normalizedDriverName = parseDriverName(rawDriverName);
   
-  console.log(`📝 Driver Name Parsing:`);
-  console.log(`  Raw: "${rawDriverName}"`);
-  console.log(`  Normalized: "${normalizedDriverName}"`);
- 
+  console.log(`📝 Driver Name: "${rawDriverName}" → "${normalizedDriverName}"`);
+  
   const data = {
     loadNumber: zapierData.loadNumber || zapierData.load_number || zapierData["8. Load Reference"],
     driver: {
@@ -143,16 +233,17 @@ function parseZapierData(zapierData) {
     deliveries: []
   };
 
-  const pickupAddrs = parseArr(zapierData.pickUp || zapierData.pickup || zapierData.pickup_address || zapierData["8. Data Pickups Address"]);
-  const pickupDates = parseArrMultiple(zapierData.pickUpDate || zapierData.pickup_date || zapierData["8. Data Pickups Date"]);
-  const pickupNums = parseArrMultiple(zapierData.pickUpNumber || zapierData.pickup_numbers || zapierData.pickup_number || zapierData["8. Data Pickups Po Numbers"]);
+  // Parse pickup data
+  const pickupAddrs = parseAddressArray(zapierData.pickUp || zapierData.pickup || zapierData.pickup_address || zapierData["8. Data Pickups Address"]);
+  const pickupDates = parseSimpleArray(zapierData.pickUpDate || zapierData.pickup_date || zapierData["8. Data Pickups Date"]);
+  const pickupNums = parseSimpleArray(zapierData.pickUpNumber || zapierData.pickup_numbers || zapierData.pickup_number || zapierData["8. Data Pickups Po Numbers"]);
 
-  console.log('📦 Pickup Numbers Parsed:', pickupNums);
+  console.log('📦 Pickup Numbers:', pickupNums);
 
-  // Remove duplicate addresses
+  // Deduplicate pickup addresses
   const uniquePickupAddrs = [];
   const seenPickups = new Set();
- 
+  
   pickupAddrs.forEach((addr, i) => {
     const normalizedAddr = addr.trim().toUpperCase().replace(/,\s+USA$/, '');
     if (!seenPickups.has(normalizedAddr)) {
@@ -161,33 +252,29 @@ function parseZapierData(zapierData) {
     }
   });
 
-  // Assign all pickup numbers
-  if (uniquePickupAddrs.length > 0) {
-    uniquePickupAddrs.forEach(({ addr, index }, i) => {
-      // First pickup gets ALL numbers, rest get fallback
-      const nums = i === 0 && pickupNums.length > 0 
-        ? pickupNums 
-        : [data.loadNumber];
-      
-      console.log(`  Pickup ${i + 1} assigned numbers:`, nums);
-      
-      data.pickups.push({
-        address: addr.trim().toUpperCase().endsWith(', USA') ? addr : `${addr}, USA`,
-        date: pickupDates[index] || pickupDates[0] || '',
-        pickUp: nums.filter(n => n)
-      });
+  // Build pickup objects
+  uniquePickupAddrs.forEach(({ addr, index }, i) => {
+    // First pickup gets all pickup numbers, others get load number
+    const nums = i === 0 && pickupNums.length > 0 ? pickupNums : [data.loadNumber];
+    
+    data.pickups.push({
+      address: addr.trim().toUpperCase().endsWith(', USA') ? addr : `${addr}, USA`,
+      date: pickupDates[index] || pickupDates[0] || '',
+      pickUp: nums.filter(Boolean)
     });
-  }
+  });
 
-  const deliveryAddrs = parseArr(zapierData.deliveries || zapierData.delivery || zapierData.delivery_address || zapierData["8. Data Deliveries Address"]);
-  const deliveryDates = parseArrMultiple(zapierData.deliveriesDate || zapierData.delivery_date || zapierData["8. Data Deliveries Date"]);
-  const deliveryNums = parseArrMultiple(zapierData.dropOffNumber || zapierData.delivery_numbers || zapierData.dropoff_number || zapierData["8. Data Deliveries Del Numbers"]);
+  // Parse delivery data
+  const deliveryAddrs = parseAddressArray(zapierData.deliveries || zapierData.delivery || zapierData.delivery_address || zapierData["8. Data Deliveries Address"]);
+  const deliveryDates = parseSimpleArray(zapierData.deliveriesDate || zapierData.delivery_date || zapierData["8. Data Deliveries Date"]);
+  const deliveryNums = parseSimpleArray(zapierData.dropOffNumber || zapierData.delivery_numbers || zapierData.dropoff_number || zapierData["8. Data Deliveries Del Numbers"]);
 
-  console.log('🚚 Delivery Numbers Parsed:', deliveryNums);
+  console.log('🚚 Delivery Numbers:', deliveryNums);
 
+  // Deduplicate delivery addresses
   const uniqueDeliveryAddrs = [];
   const seenDeliveries = new Set();
- 
+  
   deliveryAddrs.forEach((addr, i) => {
     const normalizedAddr = addr.trim().toUpperCase().replace(/,\s+USA$/, '');
     if (!seenDeliveries.has(normalizedAddr)) {
@@ -196,17 +283,14 @@ function parseZapierData(zapierData) {
     }
   });
 
-  // Distribute delivery numbers 
+  // Distribute delivery numbers across deliveries
   if (uniqueDeliveryAddrs.length > 0) {
     const numsPerDelivery = Math.ceil(deliveryNums.length / uniqueDeliveryAddrs.length);
-    console.log(`  Numbers per delivery: ${numsPerDelivery} (${deliveryNums.length} total / ${uniqueDeliveryAddrs.length} deliveries)`);
     
     uniqueDeliveryAddrs.forEach(({ addr, index }, i) => {
       const startIdx = i * numsPerDelivery;
       const endIdx = startIdx + numsPerDelivery;
       let nums = deliveryNums.slice(startIdx, endIdx);
-      
-      console.log(`  Delivery ${i + 1} assigned numbers [${startIdx}-${endIdx}):`, nums);
       
       // Fallback to load number if empty
       if (!nums || nums.length === 0 || nums.every(n => !n)) {
@@ -216,70 +300,54 @@ function parseZapierData(zapierData) {
       data.deliveries.push({
         address: addr.trim().toUpperCase().endsWith(', USA') ? addr : `${addr}, USA`,
         date: deliveryDates[index] || deliveryDates[0] || '',
-        dropOff: nums.filter(n => n)
+        dropOff: nums.filter(Boolean)
       });
     });
   }
- 
+  
   return data;
 }
 
-// form filling functions
+// ============================================================================
+// FORM FILLING FUNCTIONS
+// ============================================================================
 
-// Clear all existing location fields before filling
+/**
+ * Clear all location fields (pickups and deliveries)
+ */
 async function clearAllLocationFields(page, log) {
-  log('  🧹 Clearing all existing location fields...');
- 
+  log('  🧹 Clearing existing location fields...');
+  
   await page.evaluate(() => {
+    const fieldNames = [
+      'pickup_location', 'pickup_lat', 'pickup_long', 'pickup_number', 'pickup_date',
+      'drop_location', 'drop_lat', 'drop_long', 'drop_number', 'dropoff_date'
+    ];
+    
     for (let i = 0; i < 10; i++) {
-      const pickupAddr = document.querySelector(`input[name="pickup_location[${i}]"]`);
-      const pickupNum = document.querySelector(`input[name="pickup_number[${i}]"]`);
-      const pickupDate = document.querySelector(`input[name="pickup_date[${i}]"]`);
-      const pickupLat = document.querySelector(`input[name="pickup_lat[${i}]"]`);
-      const pickupLong = document.querySelector(`input[name="pickup_long[${i}]"]`);
-     
-      if (pickupAddr) pickupAddr.value = '';
-      if (pickupNum) {
-        if (typeof jQuery !== 'undefined' && jQuery(pickupNum).data('tagsinput')) {
+      fieldNames.forEach(fieldName => {
+        const field = document.querySelector(`input[name="${fieldName}[${i}]"]`);
+        if (!field) return;
+        
+        // Clear tagsinput if present
+        if (fieldName.includes('number') && typeof jQuery !== 'undefined' && jQuery(field).data('tagsinput')) {
           try {
-            const tags = jQuery(pickupNum).tagsinput('items');
-            tags.forEach(tag => jQuery(pickupNum).tagsinput('remove', tag));
+            const tags = jQuery(field).tagsinput('items');
+            tags.forEach(tag => jQuery(field).tagsinput('remove', tag));
           } catch (e) {}
         }
-        pickupNum.value = '';
-      }
-      if (pickupDate) pickupDate.value = '';
-      if (pickupLat) pickupLat.value = '';
-      if (pickupLong) pickupLong.value = '';
-    }
-   
-    for (let i = 0; i < 10; i++) {
-      const dropAddr = document.querySelector(`input[name="drop_location[${i}]"]`);
-      const dropNum = document.querySelector(`input[name="drop_number[${i}]"]`);
-      const dropDate = document.querySelector(`input[name="dropoff_date[${i}]"]`);
-      const dropLat = document.querySelector(`input[name="drop_lat[${i}]"]`);
-      const dropLong = document.querySelector(`input[name="drop_long[${i}]"]`);
-     
-      if (dropAddr) dropAddr.value = '';
-      if (dropNum) {
-        if (typeof jQuery !== 'undefined' && jQuery(dropNum).data('tagsinput')) {
-          try {
-            const tags = jQuery(dropNum).tagsinput('items');
-            tags.forEach(tag => jQuery(dropNum).tagsinput('remove', tag));
-          } catch (e) {}
-        }
-        dropNum.value = '';
-      }
-      if (dropDate) dropDate.value = '';
-      if (dropLat) dropLat.value = '';
-      if (dropLong) dropLong.value = '';
+        
+        field.value = '';
+      });
     }
   });
- 
-  log('  ✓ All fields cleared');
+  
+  log('  ✓ Fields cleared');
 }
 
-// field fill - no waits
+/**
+ * Fill a single field instantly
+ */
 async function fillFieldInstant(page, selector, value) {
   await page.evaluate((sel, val) => {
     const el = document.querySelector(sel);
@@ -294,52 +362,227 @@ async function fillFieldInstant(page, selector, value) {
   }, selector, value);
 }
 
+/**
+ * Fill address field with Google autocomplete - WITH RETRY AND BROWSER CHECK
+ */
 async function fillAddressInstant(page, selector, value, log) {
   const startTime = Date.now();
-  log(`  🏠 Filling address: ${selector.substring(0, 40)}...`);
- 
+  log(`  🏠 Filling address: ${value.substring(0, 50)}...`);
+  
+  // Check browser is alive before starting
+  await ensureBrowserAlive(page, log);
+  
+  // Wait between geocodes to prevent rate limiting
+  await wait(WAITS.betweenAddresses);
+  
   try {
-    await page.waitForSelector(selector, { timeout: 1000 });
+    await page.waitForSelector(selector, { timeout: TIMEOUTS.short });
   } catch (e) {
     log(`  ❌ Field not found: ${selector}`);
     throw new Error(`Field not found: ${selector}`);
   }
- 
-  await page.evaluate((sel, val) => {
+  
+  // Enable and clear field
+  await page.evaluate((sel) => {
     const el = document.querySelector(sel);
     if (el) {
       el.disabled = false;
       el.removeAttribute('disabled');
       el.classList.remove('multipleLoadDisable', 'singleLoadDisable');
       el.readOnly = false;
+      el.value = '';
       el.focus();
     }
-  }, selector, value);
+  }, selector);
 
-  await page.type(selector, value, { delay: 2 });
-  await wait(50);
- 
-  const hasAutocomplete = await page.evaluate(() => {
-    const pac = document.querySelector('.pac-container:not(.pac-container-hidden)');
-    const items = pac ? pac.querySelectorAll('.pac-item') : [];
-    return { found: items.length > 0, count: items.length };
+  await wait(500);  // Increased from 300
+
+  // Type address slowly for autocomplete to trigger
+  await page.type(selector, value, { delay: 60 });  // Increased from 50
+  await wait(1500); // Increased from 1000
+  
+  // Wait for .pac-container (Google autocomplete dropdown) to appear
+  const dropdownVisible = await page.evaluate(() => {
+    return new Promise((resolve) => {
+      let attempts = 0;
+      const maxAttempts = 25; // Increased from 20
+      
+      const checkInterval = setInterval(() => {
+        attempts++;
+        const dropdown = document.querySelector('.pac-container');
+        
+        if (dropdown && dropdown.style.display !== 'none') {
+          const items = dropdown.querySelectorAll('.pac-item');
+          if (items.length > 0) {
+            clearInterval(checkInterval);
+            resolve(true);
+            return;
+          }
+        }
+        
+        if (attempts >= maxAttempts) {
+          clearInterval(checkInterval);
+          resolve(false);
+        }
+      }, 100);
+    });
   });
- 
-  log(`  📍 Autocomplete: ${hasAutocomplete.found ? `Found ${hasAutocomplete.count} items` : 'None'}`);
- 
-  // Quick autocomplete selection
-  await page.keyboard.press('ArrowDown');
-  await wait(20); 
-  await page.keyboard.press('Enter');
-  await wait(50);
- 
-  const duration = Date.now() - startTime;
-  log(`  ✓ Address filled in ${duration}ms`);
- 
+  
+  if (dropdownVisible) {
+    log(`    ✓ Autocomplete dropdown appeared`);
+    
+    // Select first option
+    await page.keyboard.press('ArrowDown');
+    await wait(500);  // Increased from 300
+    await page.keyboard.press('Enter');
+    await wait(2000); // Increased from 1500
+  } else {
+    log(`    ⚠️ Autocomplete dropdown didn't appear, trying Enter key...`);
+    await page.keyboard.press('Enter');
+    await wait(2000);  // Increased from 1500
+  }
+  
+  // Verify lat/lng fields were populated
+  const validation = await page.evaluate((sel) => {
+    const addressInput = document.querySelector(sel);
+    if (!addressInput) return { valid: false, reason: 'address input not found' };
+    
+    const addressValue = addressInput.value.trim();
+    if (!addressValue || addressValue.length < 10) {
+      return { valid: false, reason: 'address value empty or too short', value: addressValue };
+    }
+    
+    // Extract index from selector
+    const match = sel.match(/\[(\d+)\]/);
+    const index = match ? match[1] : '0';
+    
+    // Determine if pickup or delivery
+    const isPickup = sel.includes('pickup');
+    const latField = isPickup ? `pickup_lat[${index}]` : `drop_lat[${index}]`;
+    const lngField = isPickup ? `pickup_long[${index}]` : `drop_long[${index}]`;
+    
+    const latInput = document.querySelector(`input[name="${latField}"]`);
+    const lngInput = document.querySelector(`input[name="${lngField}"]`);
+    
+    const lat = latInput?.value || '';
+    const lng = lngInput?.value || '';
+    
+    return {
+      valid: lat && lng && lat.length > 0 && lng.length > 0,
+      address: addressValue,
+      lat,
+      lng,
+      latFieldName: latField,
+      lngFieldName: lngField,
+      latExists: !!latInput,
+      lngExists: !!lngInput
+    };
+  }, selector);
+  
+  if (!validation.valid) {
+    log(`    ❌ Lat/Lng not populated! Attempting manual geocode...`);
+    log(`    Debug: ${JSON.stringify(validation)}`);
+    
+    // Fallback: Use Google Geocoding API in browser context
+    const geocoded = await page.evaluate(async (sel, addr) => {
+      const match = sel.match(/\[(\d+)\]/);
+      const index = match ? match[1] : '0';
+      const isPickup = sel.includes('pickup');
+      const latField = isPickup ? `pickup_lat[${index}]` : `drop_lat[${index}]`;
+      const lngField = isPickup ? `pickup_long[${index}]` : `drop_long[${index}]`;
+      
+      // Try using existing Google Maps instance if available
+      if (typeof google !== 'undefined' && google.maps && google.maps.Geocoder) {
+        return new Promise((resolve) => {
+          const geocoder = new google.maps.Geocoder();
+          
+          geocoder.geocode({ address: addr }, (results, status) => {
+            if (status === 'OK' && results[0]) {
+              const location = results[0].geometry.location;
+              const lat = location.lat();
+              const lng = location.lng();
+              
+              // Set the hidden fields
+              const latInput = document.querySelector(`input[name="${latField}"]`);
+              const lngInput = document.querySelector(`input[name="${lngField}"]`);
+              
+              if (latInput && lngInput) {
+                latInput.value = lat.toString();
+                lngInput.value = lng.toString();
+                
+                latInput.dispatchEvent(new Event('input', { bubbles: true }));
+                latInput.dispatchEvent(new Event('change', { bubbles: true }));
+                lngInput.dispatchEvent(new Event('input', { bubbles: true }));
+                lngInput.dispatchEvent(new Event('change', { bubbles: true }));
+                
+                resolve({ success: true, lat, lng });
+              } else {
+                resolve({ success: false, reason: 'lat/lng inputs not found' });
+              }
+            } else {
+              resolve({ success: false, reason: `Geocode failed: ${status}` });
+            }
+          });
+          
+          // Timeout after 8 seconds (increased from 5)
+          setTimeout(() => resolve({ success: false, reason: 'timeout' }), 8000);
+        });
+      }
+      
+      return { success: false, reason: 'Google Maps API not available' };
+    }, selector, value);
+    
+    if (geocoded.success) {
+      log(`    ✓ Manual geocode successful: ${geocoded.lat}, ${geocoded.lng}`);
+    } else {
+      log(`    ❌ Manual geocode failed: ${geocoded.reason}`);
+      throw new Error(`Failed to populate lat/lng for address: ${value}`);
+    }
+  } else {
+    log(`    ✓ Lat/Lng validated: ${validation.lat}, ${validation.lng}`);
+  }
+  
+  // Clear autocomplete dropdown to free memory
+  await page.evaluate(() => {
+    const dropdown = document.querySelector('.pac-container');
+    if (dropdown) dropdown.remove();
+  });
+  
+  log(`  ✓ Address filled (${Date.now() - startTime}ms)`);
   return true;
 }
 
-// tag fill 
+/**
+ * Fill address with retry logic
+ */
+async function fillAddressWithRetry(page, selector, value, log, maxRetries = 2) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await fillAddressInstant(page, selector, value, log);
+      return true;
+    } catch (error) {
+      log(`  ⚠️ Address fill attempt ${attempt} failed: ${error.message}`);
+      
+      if (attempt < maxRetries) {
+        log(`  🔄 Retrying in 3 seconds...`);
+        await wait(3000);
+        
+        // Check if page is still alive
+        try {
+          await ensureBrowserAlive(page, log);
+        } catch {
+          throw new Error('Browser connection lost - cannot retry');
+        }
+      } else {
+        throw error;
+      }
+    }
+  }
+}
+
+/**
+ * Fill tags/chips input (for PO numbers, delivery numbers)
+ */
 async function fillTagsInstant(page, selector, values, log) {
   if (!values || values.length === 0) return true;
 
@@ -347,47 +590,40 @@ async function fillTagsInstant(page, selector, values, log) {
     try {
       const input = document.querySelector(sel);
       if (!input) {
-        console.log(`Tag input not found: ${sel}`);
         return { success: false, reason: 'input not found' };
       }
-     
+      
       input.disabled = false;
       input.removeAttribute('disabled');
       input.classList.remove('multipleLoadDisable', 'singleLoadDisable');
       input.style.display = '';
 
+      // Use jQuery tagsinput if available
       if (typeof jQuery !== 'undefined' && jQuery(input).data('tagsinput')) {
         try {
+          // Clear existing tags
           const existingTags = jQuery(input).tagsinput('items');
           existingTags.forEach(tag => jQuery(input).tagsinput('remove', tag));
-        } catch (e) {
-          console.log('Error clearing existing tags:', e);
-        }
-       
+        } catch (e) {}
+        
         // Add new tags
         vals.forEach(val => {
           if (val && String(val).trim()) {
             try {
               jQuery(input).tagsinput('add', String(val).trim());
-            } catch (e) {
-              console.log('Error adding tag:', val, e);
-            }
+            } catch (e) {}
           }
         });
-       
-        // Force refresh the tagsinput to sync with hidden input
+        
         try {
           jQuery(input).tagsinput('refresh');
         } catch (e) {}
-       
-        // Verify tags were added
+        
         const finalTags = jQuery(input).tagsinput('items');
-       
         input.value = vals.filter(v => v).map(v => String(v).trim()).join(',');
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
-       
-        console.log(`Set tags for ${sel}: ${vals.join(',')} | Final tags: ${finalTags.join(',')} | Input value: ${input.value}`);
+        
         return { success: true, method: 'tagsinput', finalValue: input.value };
       } else {
         // Fallback to direct value set
@@ -395,65 +631,56 @@ async function fillTagsInstant(page, selector, values, log) {
         input.value = cleanVals.join(',');
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
-       
-        console.log(`Set tags for ${sel}: ${cleanVals.join(',')} | Final value: ${input.value}`);
+        
         return { success: true, method: 'direct', finalValue: input.value };
       }
     } catch (e) {
-      console.error(`Error setting tags for ${sel}:`, e);
       return { success: false, reason: e.message };
     }
   }, selector, values.map(String));
- 
-  await wait(50); 
- 
-  // Log the result for debugging
+  
+  await wait(WAITS.afterFieldSet);
+  
   if (!result.success) {
-    log(`    ⚠️ Failed to set tags for ${selector}: ${result.reason}`);
+    log(`    ⚠️ Failed to set tags: ${result.reason}`);
   } else {
-    log(`    ✓ Tags set for ${selector} via ${result.method}: ${result.finalValue}`);
+    log(`    ✓ Tags set via ${result.method}: ${result.finalValue}`);
   }
- 
+  
   return true;
 }
 
-// date fill 
+/**
+ * Fill date field with timezone adjustment
+ */
 async function fillDateInstant(page, selector, dateValue) {
   if (!dateValue) return true;
- 
-  const result = await page.evaluate((sel, val) => {
+  
+  await page.evaluate((sel, val) => {
     const el = document.querySelector(sel);
-    if (!el) return { success: false, reason: 'Element not found' };
+    if (!el) return;
 
     try {
-      // date string
       const parts = val.split('/');
       if (parts.length === 3) {
-        let month = parseInt(parts[0], 10) - 1; 
+        let month = parseInt(parts[0], 10) - 1;
         let day = parseInt(parts[1], 10);
         let year = parseInt(parts[2], 10);
-       
+        
+        // Add 1 day to compensate for server timezone
         day = day + 1;
-       
+        
         const testDate = new Date(year, month, day);
         if (testDate.getMonth() !== month) {
           month = testDate.getMonth();
           day = testDate.getDate();
           year = testDate.getFullYear();
         }
-       
-        // Create the adjusted date string
+        
         const adjustedVal = `${String(month + 1).padStart(2, '0')}/${String(day).padStart(2, '0')}/${year}`;
-       
-        console.log(`Date adjustment for ${val}:`, {
-          original: val,
-          adjusted: adjustedVal,
-          reason: 'Adding 1 day to compensate for server timezone shift'
-        });
-       
-        // Create date object for datepicker
         const dateObj = new Date(year, month, day, 12, 0, 0, 0);
-       
+        
+        // Set via datepicker if available
         if (typeof jQuery !== 'undefined') {
           try {
             const $el = jQuery(el);
@@ -462,41 +689,30 @@ async function fillDateInstant(page, selector, dateValue) {
               $el.datepicker('hide');
               $el.datepicker('update');
             }
-          } catch (e) {
-            console.log('Datepicker method failed:', e);
-          }
+          } catch (e) {}
         }
-     
+        
         el.value = adjustedVal;
         el.setAttribute('value', adjustedVal);
         el.setAttribute('data-date', adjustedVal);
-       
-        // Trigger all events
+        
         ['input', 'change', 'blur'].forEach(eventType => {
           el.dispatchEvent(new Event(eventType, { bubbles: true }));
         });
-       
-        const finalValue = el.value;
-        console.log(`Date set for ${sel}: original="${val}", adjusted="${adjustedVal}", actual="${finalValue}"`);
-       
-        return { success: true, finalValue, adjusted: adjustedVal };
+      } else {
+        el.value = val;
+        el.dispatchEvent(new Event('change', { bubbles: true }));
       }
-     
-      // Fallback if parsing fails
-      el.value = val;
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return { success: true, finalValue: val };
-     
-    } catch (e) {
-      return { success: false, reason: e.message };
-    }
+    } catch (e) {}
   }, selector, dateValue);
- 
-  await wait(50);
- 
-  return result.success;
+  
+  await wait(WAITS.afterFieldSet);
+  return true;
 }
 
+/**
+ * Enable all disabled fields
+ */
 async function enableAllFields(page) {
   await page.evaluate(() => {
     document.querySelectorAll('.multipleLoadDisable, .singleLoadDisable').forEach(el => {
@@ -505,7 +721,7 @@ async function enableAllFields(page) {
       el.readOnly = false;
       el.classList.remove('multipleLoadDisable', 'singleLoadDisable');
     });
-   
+    
     const div = document.querySelector('#multipleLoad');
     if (div) {
       div.classList.remove('d-none');
@@ -514,782 +730,654 @@ async function enableAllFields(page) {
   });
 }
 
-// entire location set
-async function fillLocationSetBatch(page, pickup, delivery, pickupIndex, deliveryIndex, log) {
-  // pickup address first (needs autocomplete)
+/**
+ * Fill a complete location set (pickup + delivery) - WITH RETRY
+ */
+async function fillLocationSet(page, pickup, delivery, pickupIndex, deliveryIndex, log) {
+  // Fill pickup address first (needs autocomplete)
   if (pickup) {
     log(`  📦 Pickup [${pickupIndex}]: ${pickup.address.substring(0, 40)}...`);
-    await fillAddressInstant(page, `input[name="pickup_location[${pickupIndex}]"]`, pickup.address, log);
-    // tags and date 
-    log(`  🏷️  Filling pickup tags (${pickup.pickUp.join(',')}) & date (${pickup.date})...`);
+    await fillAddressWithRetry(page, `input[name="pickup_location[${pickupIndex}]"]`, pickup.address, log);
+    
+    // Fill tags and date in parallel
     await Promise.all([
       fillTagsInstant(page, `input[name="pickup_number[${pickupIndex}]"]`, pickup.pickUp, log),
       fillDateInstant(page, `input[name="pickup_date[${pickupIndex}]"]`, pickup.date)
     ]);
+    
     log(`  ✓ Pickup complete`);
   }
 
-  // delivery address 
+  // Fill delivery address
   if (delivery) {
     log(`  🚚 Delivery [${deliveryIndex}]: ${delivery.address.substring(0, 40)}...`);
-    await fillAddressInstant(page, `input[name="drop_location[${deliveryIndex}]"]`, delivery.address, log);
-
-    log(`  🏷️  Filling delivery tags (${delivery.dropOff.join(',')}) & date (${delivery.date})...`);
-   
+    await fillAddressWithRetry(page, `input[name="drop_location[${deliveryIndex}]"]`, delivery.address, log);
+    
     await Promise.all([
       fillTagsInstant(page, `input[name="drop_number[${deliveryIndex}]"]`, delivery.dropOff, log),
       fillDateInstant(page, `input[name="dropoff_date[${deliveryIndex}]"]`, delivery.date)
     ]);
-   
-    // Verify delivery number was actually set
-    const verifyResult = await page.evaluate((idx) => {
-      const input = document.querySelector(`input[name="drop_number[${idx}]"]`);
-      return input ? input.value : 'NOT FOUND';
-    }, deliveryIndex);
-    log(`  ✓ Delivery complete (verified drop_number value: ${verifyResult})`);
+    
+    log(`  ✓ Delivery complete`);
   }
 }
 
-// main form fill function
+/**
+ * Clone location data from one index to another
+ */
+async function cloneLocationData(page, fromIndex, toIndex, isPickup, log) {
+  const locationType = isPickup ? 'pickup' : 'drop';
+  const fieldNames = isPickup 
+    ? ['pickup_location', 'pickup_lat', 'pickup_long', 'pickup_number', 'pickup_date']
+    : ['drop_location', 'drop_lat', 'drop_long', 'drop_number', 'dropoff_date'];
+  
+  log(`  📋 Cloning ${locationType} from [${fromIndex}] to [${toIndex}]...`);
+  
+  await page.evaluate((fields, from, to) => {
+    fields.forEach(fieldName => {
+      const fromField = document.querySelector(`input[name="${fieldName}[${from}]"]`);
+      const toField = document.querySelector(`input[name="${fieldName}[${to}]"]`);
+      
+      if (!fromField || !toField) return;
+      
+      toField.value = fromField.value;
+      
+      // Handle tagsinput
+      if (fieldName.includes('number') && typeof jQuery !== 'undefined' && jQuery(fromField).data('tagsinput')) {
+        const tags = jQuery(fromField).tagsinput('items');
+        tags.forEach(tag => {
+          try {
+            jQuery(toField).tagsinput('add', tag);
+          } catch (e) {}
+        });
+      }
+      
+      toField.dispatchEvent(new Event('input', { bubbles: true }));
+      toField.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }, fieldNames, fromIndex, toIndex);
+  
+  log(`  ✓ Clone complete`);
+}
+
+/**
+ * Add new pickup/delivery form and enable fields
+ */
+async function addNewLocationForm(page, expectedIndex, log) {
+  log(`  ➕ Adding new form for index ${expectedIndex}...`);
+  
+  await page.evaluate((selector) => {
+    document.querySelector(selector)?.click();
+  }, SELECTORS.addMoreForm);
+  
+  await wait(WAITS.afterFormAdd);
+  await enableAllFields(page);
+  await wait(100);
+  
+  // Verify form was created
+  const formExists = await page.evaluate((idx) => {
+    const dropAddr = document.querySelector(`input[name="drop_location[${idx}]"]`);
+    const pickupAddr = document.querySelector(`input[name="pickup_location[${idx}]"]`);
+    return {
+      dropExists: !!dropAddr,
+      pickupExists: !!pickupAddr,
+      dropVisible: dropAddr ? dropAddr.offsetParent !== null : false,
+      pickupVisible: pickupAddr ? pickupAddr.offsetParent !== null : false
+    };
+  }, expectedIndex);
+  
+  if (!formExists.dropExists || !formExists.pickupExists) {
+    log(`  ⚠️ Form fields not found, retrying...`);
+    await wait(300);
+    await page.evaluate((selector) => {
+      document.querySelector(selector)?.click();
+    }, SELECTORS.addMoreForm);
+    await wait(WAITS.afterFormAdd);
+    await enableAllFields(page);
+    
+    const retry = await page.evaluate((idx) => {
+      return {
+        dropExists: !!document.querySelector(`input[name="drop_location[${idx}]"]`),
+        pickupExists: !!document.querySelector(`input[name="pickup_location[${idx}]"]`)
+      };
+    }, expectedIndex);
+    
+    if (!retry.dropExists || !retry.pickupExists) {
+      throw new Error(`Failed to create form at index ${expectedIndex}`);
+    }
+  }
+  
+  log(`  ✓ Form added`);
+}
+
+/**
+ * Get the calculated index for pickup/delivery pairs
+ * QuikSkope uses: 0, 2, 3, 4, 5, ... (skips 1)
+ */
+function getLocationIndex(i) {
+  return i === 0 ? 0 : i === 1 ? 2 : i + 1;
+}
+
+/**
+ * Main form fill orchestration
+ */
 async function fillForm(page, data, log) {
   const formStart = Date.now();
-  console.log("=== FORM FILL (ULTRA-OPTIMIZED) ===");
   log("=== FORM FILL START ===");
- 
-  // Normalize data
+  
+  // Normalize: ensure all locations have fallback numbers
   data.pickups.forEach(p => {
     if (!p.pickUp?.length) p.pickUp = [data.loadNumber];
   });
- 
+  
   data.deliveries.forEach(d => {
     if (!d.dropOff?.length) d.dropOff = [data.loadNumber];
   });
- 
-  log(`After normalization:`);
-  log(`  Pickups: ${data.pickups.length}, Deliveries: ${data.deliveries.length}`);
-  data.deliveries.forEach((d, i) => {
-    log(`    D${i + 1} dropOff numbers: ${d.dropOff.join(',')}`);
-  });
- 
-  // Clear all old location first
+  
+  log(`Pickups: ${data.pickups.length}, Deliveries: ${data.deliveries.length}`);
+  
+  // Clear existing location data
   await clearAllLocationFields(page, log);
- 
-  // Basic Info 
-  const step1Start = Date.now();
-  console.log("📄 Basic Info");
+  
+  // ==========================================
+  // STEP 1: Basic Info (parallel fill)
+  // ==========================================
   log("STEP 1: Basic Info");
   const digitsOnly = data.driver.phone.replace(/\D/g, '');
   const formattedPhone = digitsOnly.length === 10 ? digitsOnly : `1${digitsOnly}`;
- 
+  
   await Promise.all([
-    fillFieldInstant(page, 'input[name="load_number"]', data.loadNumber),
-    fillFieldInstant(page, 'input[name="driver_name"]', data.driver.name),
-    fillFieldInstant(page, 'input#adminProfileDailingCode[name="phone_number"]', formattedPhone),
-    fillFieldInstant(page, 'input[name="carrier_name"]', data.company.name),
-    fillFieldInstant(page, 'input[name="carrier_mc_number"]', data.company.mc),
-    fillFieldInstant(page, 'input[name="carrier_dot_number"]', data.company.usdot)
+    fillFieldInstant(page, SELECTORS.loadNumber, data.loadNumber),
+    fillFieldInstant(page, SELECTORS.driverName, data.driver.name),
+    fillFieldInstant(page, SELECTORS.driverPhone, formattedPhone),
+    fillFieldInstant(page, SELECTORS.carrierName, data.company.name),
+    fillFieldInstant(page, SELECTORS.carrierMC, data.company.mc),
+    fillFieldInstant(page, SELECTORS.carrierDOT, data.company.usdot)
   ]);
- 
-  await wait(50); 
-  log(`✓ Basic info filled (${Date.now() - step1Start}ms)`);
- 
-  // Mode Selection
-  const step2Start = Date.now();
+  
+  log(`✓ Basic info filled`);
+  
+  // ==========================================
+  // STEP 2: Mode Selection
+  // ==========================================
   const isMultiple = data.pickups.length > 1 || data.deliveries.length > 1;
-  console.log(`🔘 Mode: ${isMultiple ? 'Multiple' : 'Single'}`);
   log(`STEP 2: Mode - ${isMultiple ? 'Multiple' : 'Single'}`);
- 
+  
   if (isMultiple) {
-    log('  Clicking multiple load button...');
-    await page.evaluate(() => document.querySelector('#multipleLoadButton')?.click());
-    await wait(200); 
-    log('  Enabling fields...');
+    await page.evaluate((selector) => {
+      document.querySelector(selector)?.click();
+    }, SELECTORS.multipleLoadBtn);
+    await wait(200);
     await enableAllFields(page);
-    await wait(50); 
-    log(`✓ Mode setup complete (${Date.now() - step2Start}ms)`);
+    log(`✓ Multiple mode enabled`);
   }
- 
-  // Fill locations
-  const step3Start = Date.now();
-  console.log("📍 Locations");
+  
+  // ==========================================
+  // STEP 3: Fill Locations
+  // ==========================================
   log("STEP 3: Filling locations");
-  log(`  Pickups: ${data.pickups.length}, Deliveries: ${data.deliveries.length}`);
- 
-  if (isMultiple) {
-    // Determine the scenario
+  
+  if (!isMultiple) {
+    // Single pickup → single delivery
+    await fillLocationSet(page, data.pickups[0], data.deliveries[0], 0, 0, log);
+  } else {
+    // Determine scenario
     const singlePickupMultiDrop = data.pickups.length === 1 && data.deliveries.length > 1;
     const multiPickupSingleDrop = data.pickups.length > 1 && data.deliveries.length === 1;
-    const multiPickupMultiDrop = data.pickups.length > 1 && data.deliveries.length > 1;
-   
-    log(`  Mode: ${singlePickupMultiDrop ? '1 Pickup → Multiple Drops' : multiPickupSingleDrop ? 'Multiple Pickups → 1 Drop' : multiPickupMultiDrop ? 'Multiple Pickups → Multiple Drops' : 'Unknown'}`);
-   
+    
     if (singlePickupMultiDrop) {
-      // Special case: 1 pickup with multiple deliveries
-      log(`  Single pickup with ${data.deliveries.length} deliveries`);
-     
-      // Fill the single pickup first
-      const pickup = data.pickups[0];
-      log(`--- Pickup [0] START ---`);
-      await fillLocationSetBatch(page, pickup, null, 0, 0, log);
-      log(`--- Pickup [0] DONE ---`);
-     
-      // Fill each delivery incrementally with correct indices
+      // One pickup, multiple deliveries
+      log(`  Mode: 1 Pickup → ${data.deliveries.length} Deliveries`);
+      
+      // Fill first pickup
+      await fillLocationSet(page, data.pickups[0], null, 0, 0, log);
+      
+      // Fill deliveries incrementally
       for (let i = 0; i < data.deliveries.length; i++) {
-        const setStart = Date.now();
-       
-        let deliveryIndex;
-        if (i === 0) {
-          deliveryIndex = 0;
-        } else if (i === 1) {
-          deliveryIndex = 2;
-        } else {
-          deliveryIndex = i + 1;
-        }
-       
-        log(`--- Delivery #${i + 1} (index ${deliveryIndex}) START ---`);
-       
+        const deliveryIndex = getLocationIndex(i);
+        
         if (i > 0) {
-          log('  Adding new drop form...');
-          await page.evaluate(() => document.querySelector('#addMorePickupDropForm')?.click());
-          await wait(300); 
-          await enableAllFields(page);
-          await wait(100); 
-         
-          // Verify the form was actually created
-          const formExists = await page.evaluate((delivIdx) => {
-            const dropAddr = document.querySelector(`input[name="drop_location[${delivIdx}]"]`);
-            const pickupAddr = document.querySelector(`input[name="pickup_location[${delivIdx}]"]`);
-            return {
-              dropExists: !!dropAddr,
-              pickupExists: !!pickupAddr,
-              dropVisible: dropAddr ? dropAddr.offsetParent !== null : false,
-              pickupVisible: pickupAddr ? pickupAddr.offsetParent !== null : false
-            };
-          }, deliveryIndex);
-         
-          log(`  Form verification: drop=${formExists.dropExists}/${formExists.dropVisible}, pickup=${formExists.pickupExists}/${formExists.pickupVisible}`);
-         
-          if (!formExists.dropExists || !formExists.pickupExists) {
-            log(`  ⚠️ WARNING: Form fields not found at index ${deliveryIndex}! Trying again...`);
-            await wait(300); 
-            await page.evaluate(() => document.querySelector('#addMorePickupDropForm')?.click());
-            await wait(300); 
-            await enableAllFields(page);
-            await wait(100); 
-           
-            const retry = await page.evaluate((delivIdx) => {
-              const dropAddr = document.querySelector(`input[name="drop_location[${delivIdx}]"]`);
-              const pickupAddr = document.querySelector(`input[name="pickup_location[${delivIdx}]"]`);
-              return {
-                dropExists: !!dropAddr,
-                pickupExists: !!pickupAddr
-              };
-            }, deliveryIndex);
-           
-            if (!retry.dropExists || !retry.pickupExists) {
-              log(`  ❌ ERROR: Still cannot find form fields at index ${deliveryIndex} after retry`);
-              throw new Error(`Failed to create form at index ${deliveryIndex}`);
-            }
-            log(`  ✓ Form created successfully on retry`);
-          }
-         
-          // Click the checkbox to clone the first pickup to all new pickups
-          log('  Clicking checkbox to clone pickup address...');
-          const cloneResult = await page.evaluate((delivIdx) => {
-            const checkbox = document.querySelector('#addpickcheck');
+          await addNewLocationForm(page, deliveryIndex, log);
+          
+          // Clone pickup via checkbox
+          await page.evaluate((selector) => {
+            const checkbox = document.querySelector(selector);
             if (checkbox && !checkbox.checked) {
               checkbox.click();
               checkbox.dispatchEvent(new Event('change', { bubbles: true }));
             }
-           
-            return new Promise(resolve => {
-              setTimeout(() => {
-                const pickup0 = document.querySelector(`input[name="pickup_location[0]"]`)?.value || '';
-                const pickupN = document.querySelector(`input[name="pickup_location[${delivIdx}]"]`)?.value || '';
-               
-                resolve({
-                  checkboxFound: !!checkbox,
-                  checkboxChecked: checkbox ? checkbox.checked : false,
-                  pickup0Value: pickup0.substring(0, 50),
-                  pickupNValue: pickupN.substring(0, 50),
-                  cloneWorked: pickup0 === pickupN && pickupN.length > 0
-                });
-              }, 300); 
-            });
+          }, SELECTORS.clonePickupCheckbox);
+          
+          await wait(300);
+          
+          // Verify clone worked, fallback to manual if needed
+          const cloneWorked = await page.evaluate((idx) => {
+            const pickup0 = document.querySelector(`input[name="pickup_location[0]"]`)?.value || '';
+            const pickupN = document.querySelector(`input[name="pickup_location[${idx}]"]`)?.value || '';
+            return pickup0 === pickupN && pickupN.length > 0;
           }, deliveryIndex);
-         
-          log(`  Checkbox: ${cloneResult.checkboxFound ? (cloneResult.checkboxChecked ? 'CHECKED ✓' : 'NOT CHECKED ✗') : 'NOT FOUND'}`);
-          log(`  Clone result: ${cloneResult.cloneWorked ? 'SUCCESS ✓' : 'FAILED ✗'}`);
-          log(`    pickup[0]: "${cloneResult.pickup0Value}"`);
-          log(`    pickup[${deliveryIndex}]: "${cloneResult.pickupNValue}"`);
-         
-          if (!cloneResult.cloneWorked) {
-            log('  ⚠️ WARNING: Checkbox cloning did not work! Manually copying pickup data...');
-            await page.evaluate((idx) => {
-              const pickup0Addr = document.querySelector(`input[name="pickup_location[0]"]`);
-              const pickup0Num = document.querySelector(`input[name="pickup_number[0]"]`);
-              const pickup0Date = document.querySelector(`input[name="pickup_date[0]"]`);
-              const pickup0Lat = document.querySelector(`input[name="pickup_lat[0]"]`);
-              const pickup0Long = document.querySelector(`input[name="pickup_long[0]"]`);
-             
-              const pickupAddr = document.querySelector(`input[name="pickup_location[${idx}]"]`);
-              const pickupNum = document.querySelector(`input[name="pickup_number[${idx}]"]`);
-              const pickupDate = document.querySelector(`input[name="pickup_date[${idx}]"]`);
-              const pickupLat = document.querySelector(`input[name="pickup_lat[${idx}]"]`);
-              const pickupLong = document.querySelector(`input[name="pickup_long[${idx}]"]`);
-             
-              if (pickup0Addr && pickupAddr) {
-                pickupAddr.value = pickup0Addr.value;
-                pickupAddr.dispatchEvent(new Event('input', { bubbles: true }));
-                pickupAddr.dispatchEvent(new Event('change', { bubbles: true }));
-              }
-              if (pickup0Lat && pickupLat) pickupLat.value = pickup0Lat.value;
-              if (pickup0Long && pickupLong) pickupLong.value = pickup0Long.value;
-              if (pickup0Date && pickupDate) {
-                pickupDate.value = pickup0Date.value;
-                pickupDate.dispatchEvent(new Event('input', { bubbles: true }));
-                pickupDate.dispatchEvent(new Event('change', { bubbles: true }));
-              }
-             
-              if (pickup0Num && pickupNum) {
-                if (typeof jQuery !== 'undefined' && jQuery(pickup0Num).data('tagsinput')) {
-                  const tags = jQuery(pickup0Num).tagsinput('items');
-                  tags.forEach(tag => {
-                    try {
-                      jQuery(pickupNum).tagsinput('add', tag);
-                    } catch (e) {}
-                  });
-                }
-                pickupNum.value = pickup0Num.value;
-                pickupNum.dispatchEvent(new Event('input', { bubbles: true }));
-                pickupNum.dispatchEvent(new Event('change', { bubbles: true }));
-              }
-            }, deliveryIndex);
-            log('  ✓ Manual copy complete');
-            
-            const verifyResult = await page.evaluate((idx) => {
-              const pickupAddr = document.querySelector(`input[name="pickup_location[${idx}]"]`);
-              const pickupNum = document.querySelector(`input[name="pickup_number[${idx}]"]`);
-              return {
-                address: pickupAddr ? pickupAddr.value.substring(0, 50) : 'NOT FOUND',
-                number: pickupNum ? pickupNum.value : 'NOT FOUND'
-              };
-            }, deliveryIndex);
-            log(`  Verify manual copy: addr="${verifyResult.address}", num="${verifyResult.number}"`);
+          
+          if (!cloneWorked) {
+            log(`  ⚠️ Checkbox clone failed, manual copy...`);
+            await cloneLocationData(page, 0, deliveryIndex, true, log);
           }
-         
-          log('  Form added and enabled');
         }
-       
-        await fillLocationSetBatch(page, null, data.deliveries[i], 0, deliveryIndex, log);
-        log(`--- Delivery #${i + 1} DONE (${Date.now() - setStart}ms) ---`);
+        
+        await fillLocationSet(page, null, data.deliveries[i], 0, deliveryIndex, log);
       }
-     
+      
     } else if (multiPickupSingleDrop) {
-      // Special case: Multiple pickups with 1 delivery
-      log(`  ${data.pickups.length} pickups with single delivery`);
-     
-      // Fill the single delivery at [0] FIRST
-      const delivery = data.deliveries[0];
-      log(`--- Delivery [0] START (filling first for cloning) ---`);
-      await fillLocationSetBatch(page, null, delivery, 0, 0, log);
-      log(`--- Delivery [0] DONE ---`);
-     
-      // Now fill pickups incrementally
+      // Multiple pickups, one delivery
+      log(`  Mode: ${data.pickups.length} Pickups → 1 Delivery`);
+      
+      // Fill delivery first (for cloning)
+      await fillLocationSet(page, null, data.deliveries[0], 0, 0, log);
+      
+      // Fill pickups incrementally
       for (let i = 0; i < data.pickups.length; i++) {
-        const setStart = Date.now();
-       
-        let pickupIndex;
-        if (i === 0) {
-          pickupIndex = 0;
-        } else if (i === 1) {
-          pickupIndex = 2;
-        } else {
-          pickupIndex = i + 1;
-        }
-       
-        log(`--- Pickup #${i + 1} (index ${pickupIndex}) START ---`);
-       
+        const pickupIndex = getLocationIndex(i);
+        
         if (i > 0) {
-          log('  Adding new pickup form...');
-          await page.evaluate(() => document.querySelector('#addMorePickupDropForm')?.click());
-          await wait(300); 
-          await enableAllFields(page);
-          await wait(100); 
-         
-          const formExists = await page.evaluate((pickupIdx) => {
-            const dropAddr = document.querySelector(`input[name="drop_location[${pickupIdx}]"]`);
-            const pickupAddr = document.querySelector(`input[name="pickup_location[${pickupIdx}]"]`);
-            return {
-              dropExists: !!dropAddr,
-              pickupExists: !!pickupAddr,
-              dropVisible: dropAddr ? dropAddr.offsetParent !== null : false,
-              pickupVisible: pickupAddr ? pickupAddr.offsetParent !== null : false
-            };
-          }, pickupIndex);
-         
-          log(`  Form verification: drop=${formExists.dropExists}/${formExists.dropVisible}, pickup=${formExists.pickupExists}/${formExists.pickupVisible}`);
-         
-          if (!formExists.dropExists || !formExists.pickupExists) {
-            log(`  ⚠️ WARNING: Form fields not found at index ${pickupIndex}! Trying again...`);
-            await wait(300);  
-            await page.evaluate(() => document.querySelector('#addMorePickupDropForm')?.click());
-            await wait(300); 
-            await enableAllFields(page);
-            await wait(100); 
-           
-            const retry = await page.evaluate((pickupIdx) => {
-              const dropAddr = document.querySelector(`input[name="drop_location[${pickupIdx}]"]`);
-              const pickupAddr = document.querySelector(`input[name="pickup_location[${pickupIdx}]"]`);
-              return {
-                dropExists: !!dropAddr,
-                pickupExists: !!pickupAddr
-              };
-            }, pickupIndex);
-           
-            if (!retry.dropExists || !retry.pickupExists) {
-              log(`  ❌ ERROR: Still cannot find form fields at index ${pickupIndex} after retry`);
-              throw new Error(`Failed to create form at index ${pickupIndex}`);
-            }
-            log(`  ✓ Form created successfully on retry`);
-          }
-         
-          // Click the checkbox to clone the first delivery
-          log('  Clicking checkbox to clone delivery address...');
-          const cloneResult = await page.evaluate((pickupIdx) => {
-            const checkbox = document.querySelector('#addpickcheck1');
+          await addNewLocationForm(page, pickupIndex, log);
+          
+          // Clone delivery via checkbox
+          await page.evaluate((selector) => {
+            const checkbox = document.querySelector(selector);
             if (checkbox && !checkbox.checked) {
               checkbox.click();
               checkbox.dispatchEvent(new Event('change', { bubbles: true }));
             }
-           
-            return new Promise(resolve => {
-              setTimeout(() => {
-                const drop0 = document.querySelector(`input[name="drop_location[0]"]`)?.value || '';
-                const dropN = document.querySelector(`input[name="drop_location[${pickupIdx}]"]`)?.value || '';
-               
-                resolve({
-                  checkboxFound: !!checkbox,
-                  checkboxChecked: checkbox ? checkbox.checked : false,
-                  drop0Value: drop0.substring(0, 50),
-                  dropNValue: dropN.substring(0, 50),
-                  cloneWorked: drop0 === dropN && dropN.length > 0
-                });
-              }, 300); 
-            });
+          }, SELECTORS.cloneDropCheckbox);
+          
+          await wait(300);
+          
+          const cloneWorked = await page.evaluate((idx) => {
+            const drop0 = document.querySelector(`input[name="drop_location[0]"]`)?.value || '';
+            const dropN = document.querySelector(`input[name="drop_location[${idx}]"]`)?.value || '';
+            return drop0 === dropN && dropN.length > 0;
           }, pickupIndex);
-         
-          log(`  Checkbox: ${cloneResult.checkboxFound ? (cloneResult.checkboxChecked ? 'CHECKED ✓' : 'NOT CHECKED ✗') : 'NOT FOUND'}`);
-          log(`  Clone result: ${cloneResult.cloneWorked ? 'SUCCESS ✓' : 'FAILED ✗'}`);
-          log(`    drop[0]: "${cloneResult.drop0Value}"`);
-          log(`    drop[${pickupIndex}]: "${cloneResult.dropNValue}"`);
-         
-          if (!cloneResult.cloneWorked) {
-            log('  ⚠️ WARNING: Checkbox cloning did not work! Manually copying delivery data...');
-            await page.evaluate((idx) => {
-              const drop0Addr = document.querySelector(`input[name="drop_location[0]"]`);
-              const drop0Num = document.querySelector(`input[name="drop_number[0]"]`);
-              const drop0Date = document.querySelector(`input[name="dropoff_date[0]"]`);
-              const drop0Lat = document.querySelector(`input[name="drop_lat[0]"]`);
-              const drop0Long = document.querySelector(`input[name="drop_long[0]"]`);
-             
-              const dropAddr = document.querySelector(`input[name="drop_location[${idx}]"]`);
-              const dropNum = document.querySelector(`input[name="drop_number[${idx}]"]`);
-              const dropDate = document.querySelector(`input[name="dropoff_date[${idx}]"]`);
-              const dropLat = document.querySelector(`input[name="drop_lat[${idx}]"]`);
-              const dropLong = document.querySelector(`input[name="drop_long[${idx}]"]`);
-             
-              if (drop0Addr && dropAddr) {
-                dropAddr.value = drop0Addr.value;
-                dropAddr.dispatchEvent(new Event('input', { bubbles: true }));
-                dropAddr.dispatchEvent(new Event('change', { bubbles: true }));
-              }
-              if (drop0Lat && dropLat) dropLat.value = drop0Lat.value;
-              if (drop0Long && dropLong) dropLong.value = drop0Long.value;
-              if (drop0Date && dropDate) {
-                dropDate.value = drop0Date.value;
-                dropDate.dispatchEvent(new Event('input', { bubbles: true }));
-                dropDate.dispatchEvent(new Event('change', { bubbles: true }));
-              }
-             
-              if (drop0Num && dropNum) {
-                if (typeof jQuery !== 'undefined' && jQuery(drop0Num).data('tagsinput')) {
-                  const tags = jQuery(drop0Num).tagsinput('items');
-                  tags.forEach(tag => {
-                    try {
-                      jQuery(dropNum).tagsinput('add', tag);
-                    } catch (e) {}
-                  });
-                }
-                dropNum.value = drop0Num.value;
-                dropNum.dispatchEvent(new Event('input', { bubbles: true }));
-                dropNum.dispatchEvent(new Event('change', { bubbles: true }));
-              }
-            }, pickupIndex);
-            log('  ✓ Manual copy complete');
-            
-            const verifyResult = await page.evaluate((idx) => {
-              const dropAddr = document.querySelector(`input[name="drop_location[${idx}]"]`);
-              const dropNum = document.querySelector(`input[name="drop_number[${idx}]"]`);
-              return {
-                address: dropAddr ? dropAddr.value.substring(0, 50) : 'NOT FOUND',
-                number: dropNum ? dropNum.value : 'NOT FOUND'
-              };
-            }, pickupIndex);
-            log(`  Verify manual copy: addr="${verifyResult.address}", num="${verifyResult.number}"`);
+          
+          if (!cloneWorked) {
+            log(`  ⚠️ Checkbox clone failed, manual copy...`);
+            await cloneLocationData(page, 0, pickupIndex, false, log);
           }
-         
-          log('  Form added and enabled');
         }
-       
-        await fillLocationSetBatch(page, data.pickups[i], null, pickupIndex, 0, log);
-        log(`--- Pickup #${i + 1} DONE (${Date.now() - setStart}ms) ---`);
+        
+        await fillLocationSet(page, data.pickups[i], null, pickupIndex, 0, log);
       }
-    } else if (multiPickupMultiDrop) {
-
+      
+    } else {
       // Multiple pickups AND multiple deliveries
-      log(`  ${data.pickups.length} pickups with ${data.deliveries.length} deliveries`);
-     
+      log(`  Mode: ${data.pickups.length} Pickups & ${data.deliveries.length} Deliveries`);
+      
       const maxCount = Math.max(data.pickups.length, data.deliveries.length);
-     
+      
       for (let i = 0; i < maxCount; i++) {
-        const setStart = Date.now();
-       
-        let pairIndex;
-        if (i === 0) {
-          pairIndex = 0;
-        } else if (i === 1) {
-          pairIndex = 2;
-        } else {
-          pairIndex = i + 1;
-        }
-       
-        log(`--- Pair #${i + 1} (index ${pairIndex}) START ---`);
-       
+        const pairIndex = getLocationIndex(i);
+        
         if (i > 0) {
-          log('  Adding new pickup/drop form...');
-          await page.evaluate(() => document.querySelector('#addMorePickupDropForm')?.click());
-          await wait(300); 
-          await enableAllFields(page);
-          await wait(100); 
-         
-          const formExists = await page.evaluate((pairIdx) => {
-            const dropAddr = document.querySelector(`input[name="drop_location[${pairIdx}]"]`);
-            const pickupAddr = document.querySelector(`input[name="pickup_location[${pairIdx}]"]`);
-            return {
-              dropExists: !!dropAddr,
-              pickupExists: !!pickupAddr,
-              dropVisible: dropAddr ? dropAddr.offsetParent !== null : false,
-              pickupVisible: pickupAddr ? pickupAddr.offsetParent !== null : false
-            };
-          }, pairIndex);
-         
-          log(`  Form verification: drop=${formExists.dropExists}/${formExists.dropVisible}, pickup=${formExists.pickupExists}/${formExists.pickupVisible}`);
-         
-          if (!formExists.dropExists || !formExists.pickupExists) {
-            log(`  ⚠️ WARNING: Form fields not found at index ${pairIndex}! Trying again...`);
-            await wait(300);  
-            await page.evaluate(() => document.querySelector('#addMorePickupDropForm')?.click());
-            await wait(300); 
-            await enableAllFields(page);
-            await wait(100); 
-           
-            const retry = await page.evaluate((pairIdx) => {
-              const dropAddr = document.querySelector(`input[name="drop_location[${pairIdx}]"]`);
-              const pickupAddr = document.querySelector(`input[name="pickup_location[${pairIdx}]"]`);
-              return {
-                dropExists: !!dropAddr,
-                pickupExists: !!pickupAddr
-              };
-            }, pairIndex);
-           
-            if (!retry.dropExists || !retry.pickupExists) {
-              log(`  ❌ ERROR: Still cannot find form fields at index ${pairIndex} after retry`);
-              throw new Error(`Failed to create form at index ${pairIndex}`);
-            }
-            log(`  ✓ Form created successfully on retry`);
-          }
-         
-          log('  Form added and enabled');
+          await addNewLocationForm(page, pairIndex, log);
         }
-       
+        
         const pickup = data.pickups[i] || null;
         const delivery = data.deliveries[i] || null;
-       
+        
         if (pickup && delivery) {
-          await fillLocationSetBatch(page, pickup, delivery, pairIndex, pairIndex, log);
+          await fillLocationSet(page, pickup, delivery, pairIndex, pairIndex, log);
         } else if (pickup) {
-          log(`  ⚠️ No delivery for pickup #${i + 1}, cloning last delivery...`);
-         
+          // Clone last delivery
           const lastDeliveryIndex = await page.evaluate(() => {
             for (let idx = 19; idx >= 0; idx--) {
               const drop = document.querySelector(`input[name="drop_location[${idx}]"]`);
-              if (drop && drop.value && drop.value.trim()) {
-                return idx;
-              }
+              if (drop && drop.value && drop.value.trim()) return idx;
             }
             return 0;
           });
-         
-          log(`  Cloning from delivery index ${lastDeliveryIndex} to ${pairIndex}`);
           
-          await page.evaluate((fromIdx, toIdx) => {
-            const dropAddr = document.querySelector(`input[name="drop_location[${fromIdx}]"]`);
-            const dropNum = document.querySelector(`input[name="drop_number[${fromIdx}]"]`);
-            const dropDate = document.querySelector(`input[name="dropoff_date[${fromIdx}]"]`);
-            const dropLat = document.querySelector(`input[name="drop_lat[${fromIdx}]"]`);
-            const dropLong = document.querySelector(`input[name="drop_long[${fromIdx}]"]`);
-           
-            const toDropAddr = document.querySelector(`input[name="drop_location[${toIdx}]"]`);
-            const toDropNum = document.querySelector(`input[name="drop_number[${toIdx}]"]`);
-            const toDropDate = document.querySelector(`input[name="dropoff_date[${toIdx}]"]`);
-            const toDropLat = document.querySelector(`input[name="drop_lat[${toIdx}]"]`);
-            const toDropLong = document.querySelector(`input[name="drop_long[${toIdx}]"]`);
-           
-            if (dropAddr && toDropAddr) {
-              toDropAddr.value = dropAddr.value;
-              toDropAddr.dispatchEvent(new Event('input', { bubbles: true }));
-              toDropAddr.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            if (dropLat && toDropLat) toDropLat.value = dropLat.value;
-            if (dropLong && toDropLong) toDropLong.value = dropLong.value;
-            if (dropDate && toDropDate) {
-              toDropDate.value = dropDate.value;
-              toDropDate.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            if (dropNum && toDropNum) {
-              if (typeof jQuery !== 'undefined' && jQuery(dropNum).data('tagsinput')) {
-                const tags = jQuery(dropNum).tagsinput('items');
-                tags.forEach(tag => {
-                  try {
-                    jQuery(toDropNum).tagsinput('add', tag);
-                  } catch (e) {}
-                });
-              }
-              toDropNum.value = dropNum.value;
-              toDropNum.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-          }, lastDeliveryIndex, pairIndex);
-          
-          await fillLocationSetBatch(page, pickup, null, pairIndex, pairIndex, log);
+          await cloneLocationData(page, lastDeliveryIndex, pairIndex, false, log);
+          await fillLocationSet(page, pickup, null, pairIndex, pairIndex, log);
         } else if (delivery) {
-          log(`  ⚠️ No pickup for delivery #${i + 1}, cloning last pickup...`);
-         
+          // Clone last pickup
           const lastPickupIndex = await page.evaluate(() => {
             for (let idx = 19; idx >= 0; idx--) {
               const pickup = document.querySelector(`input[name="pickup_location[${idx}]"]`);
-              if (pickup && pickup.value && pickup.value.trim()) {
-                return idx;
-              }
+              if (pickup && pickup.value && pickup.value.trim()) return idx;
             }
             return 0;
           });
-         
-          log(`  Cloning from pickup index ${lastPickupIndex} to ${pairIndex}`);
           
-          await page.evaluate((fromIdx, toIdx) => {
-            const pickupAddr = document.querySelector(`input[name="pickup_location[${fromIdx}]"]`);
-            const pickupNum = document.querySelector(`input[name="pickup_number[${fromIdx}]"]`);
-            const pickupDate = document.querySelector(`input[name="pickup_date[${fromIdx}]"]`);
-            const pickupLat = document.querySelector(`input[name="pickup_lat[${fromIdx}]"]`);
-            const pickupLong = document.querySelector(`input[name="pickup_long[${fromIdx}]"]`);
-           
-            const toPickupAddr = document.querySelector(`input[name="pickup_location[${toIdx}]"]`);
-            const toPickupNum = document.querySelector(`input[name="pickup_number[${toIdx}]"]`);
-            const toPickupDate = document.querySelector(`input[name="pickup_date[${toIdx}]"]`);
-            const toPickupLat = document.querySelector(`input[name="pickup_lat[${toIdx}]"]`);
-            const toPickupLong = document.querySelector(`input[name="pickup_long[${toIdx}]"]`);
-           
-            if (pickupAddr && toPickupAddr) {
-              toPickupAddr.value = pickupAddr.value;
-              toPickupAddr.dispatchEvent(new Event('input', { bubbles: true }));
-              toPickupAddr.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            if (pickupLat && toPickupLat) toPickupLat.value = pickupLat.value;
-            if (pickupLong && toPickupLong) toPickupLong.value = pickupLong.value;
-            if (pickupDate && toPickupDate) {
-              toPickupDate.value = pickupDate.value;
-              toPickupDate.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            if (pickupNum && toPickupNum) {
-              if (typeof jQuery !== 'undefined' && jQuery(pickupNum).data('tagsinput')) {
-                const tags = jQuery(pickupNum).tagsinput('items');
-                tags.forEach(tag => {
-                  try {
-                    jQuery(toPickupNum).tagsinput('add', tag);
-                  } catch (e) {}
-                });
-              }
-              toPickupNum.value = pickupNum.value;
-              toPickupNum.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-          }, lastPickupIndex, pairIndex);
-          
-          await fillLocationSetBatch(page, null, delivery, pairIndex, pairIndex, log);
+          await cloneLocationData(page, lastPickupIndex, pairIndex, true, log);
+          await fillLocationSet(page, null, delivery, pairIndex, pairIndex, log);
         }
-       
-        log(`--- Pair #${i + 1} DONE (${Date.now() - setStart}ms) ---`);
       }
     }
-  } else {
-    log('  Single location mode');
-    await fillLocationSetBatch(page, data.pickups[0], data.deliveries[0], 0, 0, log);
   }
- 
-  log(`✓ All locations filled (${Date.now() - step3Start}ms)`);
-  console.log("=== FILL DONE ===");
-  await wait(30); 
- 
-  // Save form
-  const step4Start = Date.now();
-  console.log("💾 Saving...");
-  log("STEP 4: Saving form");
-
-  // Clean up empty fields and duplicates
-  const cleanupResult = await page.evaluate(() => {
-    const removed = { emptyFields: 0, duplicates: 0 };
-   
+  
+  log(`✓ All locations filled`);
+  
+  // ==========================================
+  // STEP 4: Save & Confirm
+  // ==========================================
+  log("STEP 4: Saving");
+  
+  // Clean up form
+  await page.evaluate(() => {
+    // Remove error messages
     document.querySelectorAll('.text-danger, .invalid-feedback').forEach(el => el.remove());
+    
+    // Mark all as valid
     document.querySelectorAll('input').forEach(el => {
       el.style.border = '';
       el.classList.remove('is-invalid');
       el.classList.add('is-valid');
     });
-   
+    
+    // Remove empty location sets
     for (let i = 0; i < 10; i++) {
       const pickupAddr = document.querySelector(`input[name="pickup_location[${i}]"]`);
       const dropAddr = document.querySelector(`input[name="drop_location[${i}]"]`);
-     
-      const pickupHasValue = pickupAddr && pickupAddr.value.trim();
-      const dropHasValue = dropAddr && dropAddr.value.trim();
-     
-      if (!pickupHasValue && !dropHasValue) {
+      
+      if (!pickupAddr?.value.trim() && !dropAddr?.value.trim()) {
         ['pickup_location', 'pickup_lat', 'pickup_long', 'pickup_number', 'pickup_date',
          'drop_location', 'drop_lat', 'drop_long', 'drop_number', 'dropoff_date'].forEach(fieldName => {
-          const fields = document.querySelectorAll(`input[name="${fieldName}[${i}]"]`);
-          fields.forEach(field => {
-            field.remove();
-            removed.emptyFields++;
-          });
-        });
-      } else {
-        ['pickup_location', 'pickup_lat', 'pickup_long', 'pickup_number', 'pickup_date',
-         'drop_location', 'drop_lat', 'drop_long', 'drop_number', 'dropoff_date'].forEach(fieldName => {
-          const fields = document.querySelectorAll(`input[name="${fieldName}[${i}]"]`);
-          if (fields.length > 1) {
-            fields.forEach((field, idx) => {
-              if (idx > 0) {
-                field.remove();
-                removed.duplicates++;
-              }
-            });
-          }
+          document.querySelectorAll(`input[name="${fieldName}[${i}]"]`).forEach(f => f.remove());
         });
       }
     }
-   
+    
+    // Disable form validation
     const form = document.querySelector('form');
     if (form) form.noValidate = true;
-   
-    return removed;
   });
- 
-  log(`  Cleanup: removed ${cleanupResult.emptyFields} empty fields, ${cleanupResult.duplicates} duplicates`);
-
+  
+  // Click save
   try {
-    log('  Waiting for save button...');
-    await page.waitForSelector('#saveAndContinuePreviewLoad', { visible: true, timeout: 1000 });
-    log('  Save button found, clicking...');
-   
-    await page.click('#saveAndContinuePreviewLoad');
-    await wait(250); 
-   
-    log(`✓ Save button clicked (${Date.now() - step4Start}ms)`);
-    console.log("✅ Saved - waiting for modal");
-
+    await page.waitForSelector(SELECTORS.saveBtn, { visible: true, timeout: TIMEOUTS.short });
+    await page.click(SELECTORS.saveBtn);
+    await wait(1500);
+    log(`✓ Save clicked`);
   } catch (error) {
     log(`❌ Save error: ${error.message}`);
-    console.log(`⚠️ Save error: ${error.message}`);
+    return { success: false, error: true, errorMessage: 'Save button not found' };
+  }
+  
+  // Check for toast errors immediately
+  const toastError = await checkForToastError(page);
+  if (toastError.found) {
+    log(`🚨 Toast error: ${toastError.message}`);
+    return {
+      success: false,
+      error: true,
+      errorMessage: toastError.message,
+      errorType: 'toast_error',
+      loadNumber: data.loadNumber
+    };
+  }
+  
+  // ==========================================
+  // STEP 5: First Confirmation (has QS bug)
+  // ==========================================
+  log("STEP 5: First confirmation");
+  
+  // Wait for modal
+  let modalReady = false;
+  for (let i = 0; i < 20; i++) {
+    const state = await page.evaluate((modalSel, btnSel) => {
+      const modal = document.querySelector(modalSel);
+      const btn = document.querySelector(btnSel);
+      const modalVisible = modal ? (
+        modal.classList.contains('show') ||
+        modal.style.display === 'block' ||
+        modal.getAttribute('aria-modal') === 'true' ||
+        (modal.offsetParent !== null && window.getComputedStyle(modal).display !== 'none')
+      ) : false;
+      const buttonReady = btn ? (!btn.disabled && (btn.offsetParent !== null || btn.offsetWidth > 0)) : false;
+      return { modalVisible, buttonReady };
+    }, SELECTORS.confirmModal, SELECTORS.confirmBtn);
+
+    if (state.modalVisible && state.buttonReady) {
+      modalReady = true;
+      break;
+    }
+
+    await wait(WAITS.modalCheck);
+  }
+  
+  if (!modalReady) {
+    // Check for late toast error
+    const lateToast = await checkForToastError(page);
+    if (lateToast.found) {
+      return {
+        success: false,
+        error: true,
+        errorMessage: lateToast.message,
+        errorType: 'toast_error',
+        loadNumber: data.loadNumber
+      };
+    }
+    throw new Error('Confirm modal did not appear');
+  }
+  
+  // Click confirm (first save - has QS bug)
+  await page.evaluate((selector) => {
+    const btn = document.querySelector(selector);
+    if (btn) {
+      btn.disabled = false;
+      btn.click();
+    }
+  }, SELECTORS.confirmBtn);
+  
+  await Promise.race([
+    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {}),
+    wait(3000)
+  ]);
+  
+  log(`✓ First save complete (QS bug present)`);
+  
+  // Check for toast after first save
+  const toastAfterFirst = await checkForToastError(page);
+  if (toastAfterFirst.found) {
+    return {
+      success: false,
+      error: true,
+      errorMessage: toastAfterFirst.message,
+      errorType: 'toast_error',
+      loadNumber: data.loadNumber
+    };
+  }
+  
+  // ==========================================
+  // STEP 6: Second Save (QS bug workaround)
+  // ==========================================
+  log("STEP 6: Second save (QS workaround)");
+  
+  // Navigate back to Load Order
+  await page.goto("https://quikskope.com/customer/load-order", {
+    waitUntil: "domcontentloaded",
+    timeout: TIMEOUTS.navigation
+  });
+  await wait(1000);
+  
+  // Check if load was already successfully created (appears in the table)
+  const loadAlreadyExists = await page.evaluate((loadNum) => {
+    // Check if we're on the load order page with the DataTable
+    const table = document.querySelector('#loadOrderListTable');
+    if (!table) return false;
+    
+    // Search for the load number in the table
+    const rows = table.querySelectorAll('tbody tr');
+    for (const row of rows) {
+      const cells = row.querySelectorAll('td');
+      for (const cell of cells) {
+        if (cell.textContent.includes(loadNum)) {
+          return true;
+        }
+      }
+    }
     return false;
-  }
-   
-  // Sav confirmation
-  const step5Start = Date.now();
-  console.log("✅ Confirming...");
-  log("STEP 5: Confirming load");
-
-  try {
-    log('⏳ Waiting for confirm modal...');
-    let modalReady = false;
+  }, data.loadNumber);
+  
+  if (loadAlreadyExists) {
+    const totalDuration = Date.now() - formStart;
+    log(`✓ Load already exists in system - COMPLETE (${totalDuration}ms)`);
     
-    for (let i = 0; i < 6; i++) {
-      const state = await page.evaluate(() => {
-        const modal = document.querySelector('#viewLoadReceiptModel');
-        const btn = document.querySelector('#confirmLoadData');
-        return {
-          modalVisible: modal ? (modal.classList.contains('show') || modal.style.display === 'block') : false,
-          buttonReady: btn ? (!btn.disabled && btn.offsetParent !== null) : false
-        };
-      });
-      
-      if (state.modalVisible && state.buttonReady) {
-        log('✅ Modal ready!');
-        modalReady = true;
-        break;
-      }
-      
-      await wait(100);
-    }
-
-    if (!modalReady) {
-      log('❌ Modal timeout - checking for errors');
-      const errors = await page.evaluate(() => {
-        const errorElements = document.querySelectorAll('.text-danger, .invalid-feedback, .alert-danger');
-        return Array.from(errorElements).map(el => el.textContent.trim()).filter(t => t);
-      });
-      
-      if (errors.length > 0) {
-        log(`Validation errors: ${JSON.stringify(errors)}`);
-        throw new Error(`Form validation failed: ${errors.join(', ')}`);
-      }
-      
-      log('⚠️ No modal but no errors - form saved successfully in Step 4');
-      const totalDuration = Date.now() - formStart;
-      log(`=== FORM FILL COMPLETE (Total: ${totalDuration}ms) ===`);
-      return true;
-    }
-
-    log('  Clicking confirm button...');
-    await page.evaluate(() => {
-      const btn = document.querySelector('#confirmLoadData');
-      if (btn) {
-        btn.disabled = false;
-        btn.click();
-      }
+    return {
+      success: true,
+      loadNumber: data.loadNumber,
+      alreadySaved: true,
+      duration: totalDuration
+    };
+  }
+  
+  // Click Create Load again
+  await page.waitForSelector(SELECTORS.createLoadBtn, { timeout: 5000 });
+  await Promise.race([
+    page.click(SELECTORS.createLoadBtn).then(() =>
+      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 8000 }).catch(() => {})
+    ),
+    wait(500).then(() =>
+      page.evaluate((selector) => document.querySelector(selector)?.click(), SELECTORS.createLoadBtn)
+    )
+  ]).catch(() => {});
+  
+  await wait(WAITS.pageStabilize);
+  
+  // Verify form still has data
+  const formHasData = await page.evaluate(() => {
+    const loadNum = document.querySelector('input[name="load_number"]')?.value || '';
+    const driverName = document.querySelector('input[name="driver_name"]')?.value || '';
+    return loadNum.length > 0 && driverName.length > 0;
+  });
+  
+  if (!formHasData) {
+    log('⚠️ Form data lost - but may have already been saved!');
+    
+    // Double-check if load exists before failing
+    await page.goto("https://quikskope.com/customer/load-order", {
+      waitUntil: "domcontentloaded",
+      timeout: TIMEOUTS.navigation
     });
-
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 2000 }).catch(() => {}),
-      wait(2000)
-    ]);
+    await wait(1000);
     
-    const finalUrl = page.url();
-    log(`✓ Confirm complete (${Date.now() - step5Start}ms) - URL: ${finalUrl}`);
-    console.log("✅ Load confirmed!");
+    const loadExistsAfterCheck = await page.evaluate((loadNum) => {
+      const table = document.querySelector('#loadOrderListTable');
+      if (!table) return false;
+      const rows = table.querySelectorAll('tbody tr');
+      for (const row of rows) {
+        const cells = row.querySelectorAll('td');
+        for (const cell of cells) {
+          if (cell.textContent.includes(loadNum)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }, data.loadNumber);
     
-    const totalDuration = Date.now() - formStart;
-    log(`=== FORM FILL COMPLETE (Total: ${totalDuration}ms) ===`);
-    return true;
-
-  } catch (error) {
-    log(`⚠️ Confirm error: ${error.message} - assuming success (form was saved)`);
-    const totalDuration = Date.now() - formStart;
-    log(`=== FORM FILL COMPLETE (Total: ${totalDuration}ms) ===`);
-    return true;
+    if (loadExistsAfterCheck) {
+      const totalDuration = Date.now() - formStart;
+      log(`✓ Load verified in system - COMPLETE (${totalDuration}ms)`);
+      
+      return {
+        success: true,
+        loadNumber: data.loadNumber,
+        alreadySaved: true,
+        duration: totalDuration
+      };
+    }
   }
+  
+  // Click save again
+  await page.waitForSelector(SELECTORS.saveBtn, { visible: true, timeout: 3000 });
+  await page.click(SELECTORS.saveBtn);
+  await wait(1500);
+  
+  // Check for toast after second save
+  const toastAfterSecond = await checkForToastError(page);
+  if (toastAfterSecond.found) {
+    return {
+      success: false,
+      error: true,
+      errorMessage: toastAfterSecond.message,
+      errorType: 'toast_error',
+      loadNumber: data.loadNumber
+    };
+  }
+  
+  // Wait for second modal
+  let secondModalReady = false;
+  for (let i = 0; i < 20; i++) {
+    const state = await page.evaluate((modalSel, btnSel) => {
+      const modal = document.querySelector(modalSel);
+      const btn = document.querySelector(btnSel);
+      const modalVisible = modal ? (
+        modal.classList.contains('show') ||
+        modal.style.display === 'block' ||
+        modal.getAttribute('aria-modal') === 'true' ||
+        (modal.offsetParent !== null && window.getComputedStyle(modal).display !== 'none')
+      ) : false;
+      const buttonReady = btn ? (!btn.disabled && (btn.offsetParent !== null || btn.offsetWidth > 0)) : false;
+      return { modalVisible, buttonReady };
+    }, SELECTORS.confirmModal, SELECTORS.confirmBtn);
+
+    if (state.modalVisible && state.buttonReady) {
+      secondModalReady = true;
+      break;
+    }
+
+    await wait(WAITS.modalCheck);
+  }
+  
+  if (!secondModalReady) {
+    const toastFinal = await checkForToastError(page);
+    if (toastFinal.found) {
+      return {
+        success: false,
+        error: true,
+        errorMessage: toastFinal.message,
+        errorType: 'toast_error',
+        loadNumber: data.loadNumber
+      };
+    }
+    throw new Error('Second confirm modal did not appear');
+  }
+  
+  // Final confirm (this one actually works)
+  await page.evaluate((selector) => {
+    const btn = document.querySelector(selector);
+    if (btn) {
+      btn.disabled = false;
+      btn.click();
+    }
+  }, SELECTORS.confirmBtn);
+  
+  await Promise.race([
+    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 4000 }).catch(() => {}),
+    wait(4000)
+  ]);
+  
+  // Final toast check
+  const toastAfterConfirm = await checkForToastError(page);
+  if (toastAfterConfirm.found) {
+    return {
+      success: false,
+      error: true,
+      errorMessage: toastAfterConfirm.message,
+      errorType: 'toast_error',
+      loadNumber: data.loadNumber
+    };
+  }
+  
+  const totalDuration = Date.now() - formStart;
+  log(`✓ COMPLETE (${totalDuration}ms)`);
+  
+  return { success: true };
 }
 
-//main handler
+// ============================================================================
+// MAIN HANDLER
+// ============================================================================
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -1298,44 +1386,38 @@ export default async function handler(req, res) {
   let browser;
   const start = Date.now();
   const logs = [];
- 
+  
   const log = (message) => {
     logs.push({ time: new Date().toISOString(), message });
     console.log(message);
   };
- 
+  
   try {
     const QS_USERNAME = process.env.QS_USERNAME;
     const QS_PASSWORD = process.env.QS_PASSWORD;
     const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
-   
+    
     if (!QS_USERNAME || !QS_PASSWORD) {
       throw new Error("Missing credentials");
     }
-   
+    
+    // Parse incoming data
     const data = parseZapierData(req.body);
-   
-    log(`Parsed data:`);
-    log(`  Load: ${data.loadNumber}`);
-    log(`  Driver: ${data.driver.name} (${data.driver.phone})`);
-    log(`  Company: ${data.company.name} (MC: ${data.company.mc}, DOT: ${data.company.usdot})`);
-    log(`  Pickups: ${data.pickups.length}`);
-    data.pickups.forEach((p, i) => {
-      log(`    P${i + 1}: ${p.address} | Date: ${p.date} | PO: ${p.pickUp.join(',')}`);
-    });
-    log(`  Deliveries: ${data.deliveries.length}`);
-    data.deliveries.forEach((d, i) => {
-      log(`    D${i + 1}: ${d.address} | Date: ${d.date} | Del#: ${d.dropOff.join(',')}`);
-    });
-   
+    
+    log(`Load: ${data.loadNumber}`);
+    log(`Driver: ${data.driver.name} (${data.driver.phone})`);
+    log(`Company: ${data.company.name} (MC: ${data.company.mc}, DOT: ${data.company.usdot})`);
+    log(`Pickups: ${data.pickups.length}, Deliveries: ${data.deliveries.length}`);
+    
+    // Validate required fields
     if (!data.loadNumber || !data.driver.name || !data.pickups.length || !data.deliveries.length) {
       return res.status(400).json({
         error: 'Missing required fields',
         logs
       });
     }
-    log(`Load: ${data.loadNumber} | P:${data.pickups.length} D:${data.deliveries.length}`);
-   
+    
+    // Launch browser
     if (BROWSERLESS_TOKEN) {
       browser = await puppeteer.connect({
         browserWSEndpoint: `wss://chrome.browserless.io?token=${BROWSERLESS_TOKEN}&stealth&blockAds`,
@@ -1356,35 +1438,45 @@ export default async function handler(req, res) {
       });
       log('Launched browser');
     }
-   
+    
     const page = await browser.newPage();
-    await page.setDefaultNavigationTimeout(12000); 
-    await page.setDefaultTimeout(8000); 
-   
+    await page.setDefaultNavigationTimeout(TIMEOUTS.navigation);
+    await page.setDefaultTimeout(TIMEOUTS.selector);
+    
+    // Auto-accept dialogs
+    page.on('dialog', async dialog => {
+      log(`🔔 Alert: "${dialog.message()}"`);
+      await dialog.accept();
+    });
+    
+    // Block unnecessary resources
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
-      if (type === 'document' || type === 'script' || type === 'xhr' || type === 'fetch') {
+      if (['document', 'script', 'xhr', 'fetch'].includes(type)) {
         req.continue();
       } else {
         req.abort();
       }
     });
-   
+    
     await page.setViewport({ width: 1280, height: 720 });
-   
+    
+    // ==========================================
+    // Login
+    // ==========================================
     log("Logging in...");
     await page.goto("https://quikskope.com/platform", {
       waitUntil: "domcontentloaded",
       timeout: 30000
     });
 
-    const logged = await page.evaluate(() => {
+    const isLoggedIn = await page.evaluate(() => {
       return !!(document.querySelector("nav") || document.body.textContent.includes("logout"));
     }).catch(() => false);
 
-    if (!logged) {
-      await page.waitForSelector('#adminLoginForm', { timeout: 8000 }); 
+    if (!isLoggedIn) {
+      await page.waitForSelector('#adminLoginForm', { timeout: TIMEOUTS.selector });
       await page.evaluate((user, pass) => {
         document.querySelector('input#email').value = user;
         document.querySelector('input#password').value = pass;
@@ -1392,7 +1484,7 @@ export default async function handler(req, res) {
       }, QS_USERNAME, QS_PASSWORD);
 
       await page.waitForNavigation({
-        timeout: 15000, 
+        timeout: 15000,
         waitUntil: "domcontentloaded"
       });
       log("✓ Logged in");
@@ -1400,70 +1492,97 @@ export default async function handler(req, res) {
       log("✓ Already logged in");
     }
 
-    log("Navigating to Load Order page...");
+    await wait(WAITS.pageStabilize);
+
+    // ==========================================
+    // Navigate to Create Load
+    // ==========================================
+    log("Navigating to Load Order...");
     await page.goto("https://quikskope.com/customer/load-order", {
       waitUntil: "domcontentloaded",
-      timeout: 12000
+      timeout: TIMEOUTS.navigation
     });
-   
-    await wait(1500);  
+    
+    await wait(2000);
     log("✓ On Load Order page");
-   
-    log("Clicking Create Load button...");
-    await page.waitForSelector('a#createLoadByForm', { timeout: 4000 }); 
-   
-    // click logic
-    await Promise.race([
-      page.click('a#createLoadByForm').then(() =>
-        page.waitForNavigation({
-          waitUntil: "domcontentloaded",
-          timeout: 8000 
-        }).catch(() => {})
-      ),
-      wait(500).then(() =>
-        page.evaluate(() => document.querySelector('a#createLoadByForm')?.click())
-      )
-    ]).catch(() => {});
-   
-    await wait(1500); 
-    log("✓ Clicked Create Load button");
+    
+    log("Clicking Create Load...");
+    try {
+      await page.waitForSelector(SELECTORS.createLoadBtn, { visible: true, timeout: 3000 });
+      
+      await Promise.race([
+        page.click(SELECTORS.createLoadBtn).then(() =>
+          page.waitForNavigation({
+            waitUntil: "domcontentloaded",
+            timeout: 8000
+          }).catch(() => {})
+        ),
+        wait(500).then(() =>
+          page.evaluate((selector) => document.querySelector(selector)?.click(), SELECTORS.createLoadBtn)
+        )
+      ]).catch(() => {});
+      
+      log("✓ Create Load clicked");
+    } catch (error) {
+      log(`⚠️ Button click failed, navigating directly...`);
+      await page.goto("https://quikskope.com/customer/create-load", {
+        waitUntil: "domcontentloaded",
+        timeout: TIMEOUTS.navigation
+      });
+    }
 
-    log("Waiting for load form...");
-    await page.waitForSelector('input[name="load_number"]', { timeout: 8000 }); 
-    await wait(300); 
-    log("✓ Load form is ready");
-   
-    log("Starting form fill...");
-    const fillSuccess = await fillForm(page, data, log);
-   
-    if (!fillSuccess) {
-      log("❌ Form fill failed");
+    await wait(2000);
+    
+    // ==========================================
+    // Fill Form
+    // ==========================================
+    log("Waiting for form...");
+    await page.waitForSelector(SELECTORS.loadNumber, { timeout: 10000 });
+    await wait(300);
+    log("✓ Form ready");
+    
+    log("Filling form...");
+    const fillResult = await fillForm(page, data, log);
+
+    // Handle errors
+    if (!fillResult.success) {
+      if (fillResult.error) {
+        const duration = Date.now() - start;
+        return res.status(200).json({
+          success: false,
+          error: true,
+          loadNumber: data.loadNumber,
+          duration,
+          message: `Error: ${fillResult.errorMessage}`,
+          errorMessage: fillResult.errorMessage,
+          errorType: fillResult.errorType,
+          logs,
+          toastAlert: fillResult.errorMessage
+        });
+      }
+      
       return res.status(500).json({
         error: 'Form fill failed',
         logs
       });
     }
 
-    await wait(800); 
-   
-    const finalUrl = page.url();
-    log(`Final URL: ${finalUrl}`);
-   
+    // Success
     const duration = Date.now() - start;
-    log(`✅ SUCCESS - Total time: ${duration}ms`);
-   
+    log(`✅ SUCCESS - ${duration}ms`);
+    
     return res.status(200).json({
       success: true,
       loadNumber: data.loadNumber,
       duration,
       message: `Load ${data.loadNumber} submitted successfully`,
-      logs
+      logs,
+      toastAlert: null
     });
 
   } catch (error) {
     log(`❌ ERROR: ${error.message}`);
-    log(`Stack: ${error.stack}`);
-   
+    
     return res.status(500).json({
       error: error.message,
       stack: error.stack,
